@@ -1,0 +1,59 @@
+name: DeFi Alert
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: defi-alert
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+
+    env:
+      TG_TOKEN: ${{ secrets.TG_TOKEN }}
+      TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+      CHAIN_FILTER: Ethereum
+      MIN_TVL_USD: "1000000"
+      APY_ABS_CHANGE_ALERT: "0.30"
+      APY_REL_CHANGE_ALERT: "20"
+      TVL_ABS_CHANGE_ALERT: "1000000"
+      TVL_REL_CHANGE_ALERT: "3"
+      SEND_FIRST_RUN: "true"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Restore previous state
+        uses: actions/cache/restore@v4
+        with:
+          path: .cache
+          key: defi-alert-state-${{ github.run_id }}
+          restore-keys: |
+            defi-alert-state-
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run monitor
+        run: python monitor.py
+
+      - name: Save current state
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: .cache
+          key: defi-alert-state-${{ github.run_id }}
