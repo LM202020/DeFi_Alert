@@ -12,7 +12,8 @@ permissions:
 concurrency:
   group: defi-alert
   cancel-in-progress: false
-
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 jobs:
   monitor:
     runs-on: ubuntu-latest
