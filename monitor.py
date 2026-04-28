@@ -7,7 +7,8 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 
-API_URL = "https://yields.llama.fi/pools"
+DEFILLAMA_API_URL = "https://yields.llama.fi/pools"
+MORPHO_API_URL = "https://api.morpho.org/graphql"
 
 STATE_DIR = Path(".cache")
 STATE_FILE = STATE_DIR / "state.json"
@@ -25,7 +26,7 @@ SEND_FIRST_RUN = os.getenv("SEND_FIRST_RUN", "true").lower() == "true"
 
 MAX_MESSAGE_LEN = 3900
 
-TARGET_POOLS = {
+DEFILLAMA_TARGET_POOLS = {
     "aa70268e-4b52-42bf-a116-608b370f9501": "Aave V3 USDC",
     "f981a304-bb6c-45b8-b0c5-fd2f515ad23a": "Aave V3 USDT",
     "7da72d09-56ca-4ec5-a45f-59114353e487": "Compound V3 USDC",
@@ -35,6 +36,32 @@ TARGET_POOLS = {
     "65ce8276-b4d9-41ba-9f6f-21fc374cf9bc": "SparkLend USDC",
     "8fbe28b8-140d-4e37-8804-5d2aba4daded": "SparkLend USDT",
 }
+
+MORPHO_TARGET_VAULTS = {
+    "0xbEef047a543E45807105E51A8BBEFCc5950fcfBa": "Morpho Steakhouse USDT",
+    "0xBEEF01735c132Ada46AA9aA4c54623cAA92A64CB": "Morpho Steakhouse USDC",
+}
+
+MORPHO_QUERY = """
+query GetVault($address: String!, $chainId: Int!) {
+  vaultByAddress(address: $address, chainId: $chainId) {
+    address
+    name
+    symbol
+    asset {
+      address
+      symbol
+      decimals
+    }
+    state {
+      totalAssetsUsd
+      apy
+      netApy
+      fee
+    }
+  }
+}
+"""
 
 
 def now_utc():
@@ -102,16 +129,114 @@ def save_state(state):
         json.dump(state, f, indent=2, ensure_ascii=False, sort_keys=True)
 
 
-def fetch_pools():
-    response = requests.get(API_URL, timeout=60)
+def fetch_defillama_pools():
+    response = requests.get(DEFILLAMA_API_URL, timeout=60)
     response.raise_for_status()
 
     data = response.json()
 
     if data.get("status") != "success":
-        raise RuntimeError(f"API status is not success: {data.get('status')}")
+        raise RuntimeError(f"DeFiLlama API status is not success: {data.get('status')}")
 
     return data.get("data", [])
+
+
+def fetch_defillama_items():
+    pools = fetch_defillama_pools()
+    pool_map = {str(p.get("pool")): p for p in pools}
+
+    items = []
+    missing = []
+
+    for pool_id, display_name in DEFILLAMA_TARGET_POOLS.items():
+        pool = pool_map.get(pool_id)
+
+        if not pool:
+            missing.append((pool_id, display_name))
+            continue
+
+        item = {
+            "id": f"defillama:{pool_id}",
+            "name": display_name,
+            "source": "DeFiLlama",
+            "pool": pool_id,
+            "project": pool.get("project"),
+            "chain": pool.get("chain"),
+            "symbol": pool.get("symbol"),
+            "poolMeta": pool.get("poolMeta"),
+            "apy": safe_float(pool.get("apy")),
+            "apyBase": safe_float(pool.get("apyBase")),
+            "apyReward": safe_float(pool.get("apyReward")),
+            "tvlUsd": safe_float(pool.get("tvlUsd")),
+            "updatedAt": now_utc(),
+        }
+
+        items.append(item)
+
+    return items, missing
+
+
+def fetch_morpho_vault(address, display_name):
+    payload = {
+        "query": MORPHO_QUERY,
+        "variables": {
+            "address": address,
+            "chainId": 1,
+        },
+    }
+
+    response = requests.post(MORPHO_API_URL, json=payload, timeout=30)
+    response.raise_for_status()
+
+    data = response.json()
+
+    if data.get("errors"):
+        raise RuntimeError(f"Morpho API error for {display_name}: {data['errors']}")
+
+    vault = data.get("data", {}).get("vaultByAddress")
+
+    if not vault:
+        raise RuntimeError(f"Morpho vault not found: {display_name} {address}")
+
+    state = vault.get("state") or {}
+    asset = vault.get("asset") or {}
+
+    apy_decimal = safe_float(state.get("netApy"), None)
+
+    if apy_decimal is None:
+        apy_decimal = safe_float(state.get("apy"))
+
+    item = {
+        "id": f"morpho:{address.lower()}",
+        "name": display_name,
+        "source": "Morpho",
+        "pool": address,
+        "project": "morpho",
+        "chain": "Ethereum",
+        "symbol": asset.get("symbol"),
+        "poolMeta": vault.get("name"),
+        "apy": safe_float(apy_decimal) * 100,
+        "apyBase": safe_float(apy_decimal) * 100,
+        "apyReward": 0.0,
+        "tvlUsd": safe_float(state.get("totalAssetsUsd")),
+        "updatedAt": now_utc(),
+    }
+
+    return item
+
+
+def fetch_morpho_items():
+    items = []
+    missing = []
+
+    for address, display_name in MORPHO_TARGET_VAULTS.items():
+        try:
+            item = fetch_morpho_vault(address, display_name)
+            items.append(item)
+        except Exception as e:
+            missing.append((address, display_name, str(e)))
+
+    return items, missing
 
 
 def send_telegram(text):
@@ -160,6 +285,7 @@ def build_first_run_message(items):
     for item in items:
         lines.append("")
         lines.append(f"• <b>{item['name']}</b>")
+        lines.append(f"  来源：{item['source']}")
         lines.append(f"  APY：{fmt_pct(item['apy'])}")
         lines.append(f"  TVL：{fmt_usd(item['tvlUsd'])}")
         lines.append(f"  project：{item['project']}")
@@ -177,6 +303,7 @@ def build_alert_message(alerts):
 
     for alert in alerts:
         lines.append(f"• <b>{alert['name']}</b>")
+        lines.append(f"  来源：{alert['source']}")
 
         if alert["apy_alert"]:
             lines.append(
@@ -199,97 +326,87 @@ def build_alert_message(alerts):
     return "\n".join(lines).strip()
 
 
-def main():
-    print(f"Start monitor at {now_utc()}")
-
-    pools = fetch_pools()
-    pool_map = {str(p.get("pool")): p for p in pools}
-
-    old_state = load_state()
-    old_pools = old_state.get("pools", {})
-
-    current_pools = {}
-    current_items = []
-    missing_pools = []
+def compare_items(current_items, old_pools):
     alerts = []
 
-    for pool_id, display_name in TARGET_POOLS.items():
-        pool = pool_map.get(pool_id)
-
-        if not pool:
-            missing_pools.append((pool_id, display_name))
-            continue
-
-        apy = safe_float(pool.get("apy"))
-        apy_base = safe_float(pool.get("apyBase"))
-        apy_reward = safe_float(pool.get("apyReward"))
-        tvl = safe_float(pool.get("tvlUsd"))
-
-        item = {
-            "name": display_name,
-            "pool": pool_id,
-            "project": pool.get("project"),
-            "chain": pool.get("chain"),
-            "symbol": pool.get("symbol"),
-            "poolMeta": pool.get("poolMeta"),
-            "apy": apy,
-            "apyBase": apy_base,
-            "apyReward": apy_reward,
-            "tvlUsd": tvl,
-            "updatedAt": now_utc(),
-        }
-
-        current_pools[pool_id] = item
-        current_items.append(item)
-
-        old = old_pools.get(pool_id)
+    for item in current_items:
+        item_id = item["id"]
+        old = old_pools.get(item_id)
 
         if not old:
             continue
 
         old_apy = safe_float(old.get("apy"))
+        new_apy = safe_float(item.get("apy"))
+
         old_tvl = safe_float(old.get("tvlUsd"))
+        new_tvl = safe_float(item.get("tvlUsd"))
 
-        apy_diff = apy - old_apy
-        apy_rel = pct_change(old_apy, apy)
+        apy_diff = new_apy - old_apy
+        apy_rel = pct_change(old_apy, new_apy)
 
-        tvl_diff = tvl - old_tvl
-        tvl_rel = pct_change(old_tvl, tvl)
+        tvl_diff = new_tvl - old_tvl
+        tvl_rel = pct_change(old_tvl, new_tvl)
 
         apy_alert = abs(apy_diff) >= APY_ABS_CHANGE_ALERT or abs(apy_rel) >= APY_REL_CHANGE_ALERT
         tvl_alert = abs(tvl_diff) >= TVL_ABS_CHANGE_ALERT or abs(tvl_rel) >= TVL_REL_CHANGE_ALERT
 
         if apy_alert or tvl_alert:
             alerts.append({
-                "name": display_name,
+                "name": item["name"],
+                "source": item["source"],
                 "apy_alert": apy_alert,
                 "tvl_alert": tvl_alert,
                 "old_apy": old_apy,
-                "new_apy": apy,
+                "new_apy": new_apy,
                 "apy_diff": apy_diff,
                 "apy_rel": apy_rel,
                 "old_tvl": old_tvl,
-                "new_tvl": tvl,
+                "new_tvl": new_tvl,
                 "tvl_diff": tvl_diff,
                 "tvl_rel": tvl_rel,
             })
 
+    return alerts
+
+
+def main():
+    print(f"Start monitor at {now_utc()}")
+
+    defillama_items, defillama_missing = fetch_defillama_items()
+    morpho_items, morpho_missing = fetch_morpho_items()
+
+    current_items = defillama_items + morpho_items
+
+    old_state = load_state()
+    old_pools = old_state.get("pools", {})
+
+    current_pools = {item["id"]: item for item in current_items}
+    alerts = compare_items(current_items, old_pools)
+
     new_state = {
         "updatedAt": now_utc(),
         "pools": current_pools,
-        "missingPools": missing_pools,
+        "defillamaMissing": defillama_missing,
+        "morphoMissing": morpho_missing,
     }
 
     save_state(new_state)
 
-    print(f"Target pools: {len(TARGET_POOLS)}")
-    print(f"Found pools: {len(current_items)}")
-    print(f"Missing pools: {len(missing_pools)}")
+    print(f"DeFiLlama target pools: {len(DEFILLAMA_TARGET_POOLS)}")
+    print(f"DeFiLlama found pools: {len(defillama_items)}")
+    print(f"DeFiLlama missing pools: {len(defillama_missing)}")
+    print(f"Morpho target vaults: {len(MORPHO_TARGET_VAULTS)}")
+    print(f"Morpho found vaults: {len(morpho_items)}")
+    print(f"Morpho missing vaults: {len(morpho_missing)}")
+    print(f"Total monitored items: {len(current_items)}")
     print(f"Alerts: {len(alerts)}")
 
     for item in current_items:
         print(
             item["name"],
+            "source:",
+            item["source"],
             "APY:",
             item["apy"],
             "TVL:",
@@ -300,10 +417,15 @@ def main():
             item["symbol"],
         )
 
-    if missing_pools:
-        print("Missing target pools:")
-        for pool_id, display_name in missing_pools:
+    if defillama_missing:
+        print("Missing DeFiLlama target pools:")
+        for pool_id, display_name in defillama_missing:
             print(display_name, pool_id)
+
+    if morpho_missing:
+        print("Missing Morpho target vaults:")
+        for address, display_name, error in morpho_missing:
+            print(display_name, address, error)
 
     if not old_pools:
         print("No previous state found.")
